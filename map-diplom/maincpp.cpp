@@ -23,6 +23,7 @@ public:
 	//safe_queue<T>* pop = this;
 	std::mutex m;
 	std::condition_variable cond_flag;
+	std::atomic<bool> end_flag;
 public:
 	std::queue<T> q;
 	//добавляет заадачу в очередь, кидает уведомление, что очередь не пуста -- можно попить
@@ -30,7 +31,9 @@ public:
 		{
 			std::lock_guard<std::mutex> lg(m);			
 			q.push(obj);
-			std::cout << std::this_thread::get_id() << " obj added to queue" << std::endl;			
+			MU.lock();
+			std::cout << std::this_thread::get_id() << " obj added to queue" << std::endl;
+			MU.unlock();
 		}
 		cond_flag.notify_one();
 		
@@ -39,25 +42,37 @@ public:
 	auto q_pop() {
 			std::unique_lock<std::mutex> lk(m);
 
-			cond_flag.wait(lk, [this] {return !q.empty(); });//как предикат добавить возврат актуального состояния очереди 
+			cond_flag.wait(lk, [this] {return !q.empty() || end_flag.load(); });
+			
+			//попробовать вернуть лямбду с брейком
+			if (q.empty() && end_flag.load()) {
+				return std::function<void()>([] {});
+			}
 
 			auto task = q.front();
 			q.pop();
-			std::cout << "obj popped from queue" << std::endl;
+			//std::cout << "obj popped from queue" << std::endl;
 
 			return task;
+
 	}
-	/*T q_front() {
-		std::lock_guard<std::mutex> lg(m);
-		if (q.empty()) {
-			throw std::runtime_error("queue is empty!");
-		}
-		return q.front();
-	}*/
+
 
 	bool is_empty() {
 		bool buf = q.empty();
 		return buf;
+	}
+
+	void set_end_flag(bool val) {
+		end_flag.store(val);
+	}
+
+	void cond_all_notify() {
+		cond_flag.notify_all();
+	}
+
+	bool get_status_end_flag() {
+		return end_flag.load();
 	}
 
 };
@@ -68,8 +83,10 @@ class thread_pool {
 	safe_queue<T> sq;
 	int th_number; //количество ядер
 	int busy_th = 3;//количество занятых потоков
-	std::atomic<bool> sq_flag;
-	std::mutex mtx;
+	std::condition_variable end;
+	std::mutex mtx;//thread_pool mutex
+	
+	
 	
 public:
 	//предусмотреть выход из бесконечного цикла и дожидания завершения выполнения потоков
@@ -78,9 +95,10 @@ public:
 		while (true) {
 			std::this_thread::sleep_for(200ms);
 			if (sq.is_empty()) {
-				sq_flag.store(false);
-				std::cout << "FLAG SET ON FALSE!" << std::endl;
-				vec_th.clear();
+				//sq_flag.store(false);
+				//std::cout << "FLAG SET ON FALSE!" << std::endl;
+				submit(std::function<void()>([this] { sq.set_end_flag(true); sq.cond_all_notify(); }));
+				//vec_th.clear();
 				break;
 			}
 		}
@@ -99,29 +117,31 @@ public:
 			std::lock_guard<std::mutex>lk(mtx);
 			//std::cout << "Start thread with id: " << std::this_thread::get_id() << std::endl;
 			vec_th.push_back(std::thread(std::bind(& thread_pool<std::function<void()>>::work, this)));
-			sq_flag.store(true);
+			sq.set_end_flag(false);
 		}
 			
 	}
 	//вытаскивает очереднб задачу и выполняет ее, проверяет не пуста ли очередь
 	//забрать задачу, вызвать pop до тех пор, пока очередь полностью не опустеет
+	// 
+	//нужны отдельные condition_variables чисто для воркера, которые управляют его работой 
+	// -- есть задачи, крутим дальше -- нет задач -- прерываем??? -- нужен флаг булевой еще
 	void work() {
-		while (sq_flag.load()) {
-				auto task = sq.q_pop();
-				/*MU.lock();
-				std::cout << "work method in th: " << std::this_thread::get_id() << " ";
-				MU.unlock();*/
-				task();
+		while (true) {
+			
+			auto task = sq.q_pop();
+			
+			if (sq.get_status_end_flag()) { break; };
+			task();
+
 		}
 	};
 	//помещает очередь в задачу. аргументом принимает или std::function или std::packaged_task (на выбор!)
 	void submit(T obj) {
-		//std::lock_guard<std::mutex> k(mtx);
 		sq.q_push(obj);
 	};
 
 };
-//std::mutex MU;
 
 //функция для теста 1
 void test_f1() {
@@ -172,9 +192,4 @@ int main() {
 
 	return 0;
 }
-
-//воркер подается в конструктор потоков, который реализован на бесконечном цикле кручения вектора потоков, который является полем
-//  класса (пока не закончатся задачи)
-//что делать с сабмит??
-//что-то с очередью?
 
